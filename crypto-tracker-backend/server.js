@@ -27,7 +27,7 @@ io.on("connection", (socket) => {
     const fetchPrices = async () => {
         try {
             const { data } = await axios.get(COIN_API_URL, {
-                params: { vs_currency: "usd", order: "market_cap_desc", per_page: 10, page: 1 }
+                params: { vs_currency: "usd", order: "market_cap_desc", per_page: 50, page: 1 }
             });
             socket.emit("cryptoData", data);
         } catch (error) {
