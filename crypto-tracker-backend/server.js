@@ -5,6 +5,7 @@ const cors = require("cors");
 const http = require("http");
 const mongoose = require("mongoose");
 const { Server } = require("socket.io");
+const Redis = require("ioredis");
 const Coin = require("./models/Coin");
 const SearchHistory = require("./models/SearchHistory");
 
@@ -12,32 +13,40 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+// Redis setup
+const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+
+// Middleware
 app.use(cors());
 app.use(express.json());
 
 // Connect MongoDB
 mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-    .then(() => console.log("MongoDB Connected"))
-    .catch(err => console.log(err));
+    .then(() => console.log(" Connected"))
+    .catch(err => console.error("MongoDBError:", err));
 
-const COIN_API_URL = "https://api.coingecko.com/api/v3/coins/markets?vs_currency";
+const COIN_API_URL = "https://api.coingecko.com/api/v3/coins/markets";
 const CURRENCY = "usd";
+
+// Fetch cryptocurrency data with caching
 const fetchCryptoData = async () => {
     try {
-        const { data } = await axios.get(COIN_API_URL, {
-            params: { vs_currency: "usd", order: "market_cap_desc", per_page: 50, page: 1 }
-        });
+        const cacheKey = "cryptoData";
+        const cachedData = await redis.get(cacheKey);
 
-        if (!data || data.length === 0) {
-           // console.log("No data.");
+        if (cachedData) {
+            console.log("Data from Cache");
+            io.emit("cryptoData", JSON.parse(cachedData));
             return;
         }
 
-       // console.log("data from API:", data.length, "coins");
+        const { data } = await axios.get(COIN_API_URL, {
+            params: { vs_currency: CURRENCY, order: "market_cap_desc", per_page: 50, page: 1 }
+        });
 
-        await Coin.deleteMany({}); // Clear old data
-        console.log("cleared.");
+        if (!data || data.length === 0) return;
 
+        await Coin.deleteMany({});
         await Coin.insertMany(data.map(coin => ({
             id: coin.id,
             name: coin.name,
@@ -49,41 +58,74 @@ const fetchCryptoData = async () => {
             last_updated: new Date()
         })));
 
-       // console.log("inserted into MongoDB.");
+        await redis.set(cacheKey, JSON.stringify(data), "EX", 10);
+        console.log("Data Cached!");
+
         io.emit("cryptoData", data);
     } catch (error) {
-       // console.error(" Error fetchCryptoData:", error);
+        console.error("Erro:", error);
     }
 };
 
-
-// Fetch data every 10 seconds
+// Fetch every 10 seconds
 setInterval(fetchCryptoData, 10000);
+
 io.on("connection", (socket) => {
-    console.log("connected");
+    console.log("Connected");
 
     socket.on("search", async (query) => {
-      //  await SearchHistory.deleteMany({}); // Clear old data
         await SearchHistory.create({ searchQuery: query });
-       // console.log("Search query saved:", query);
+        console.log(" Search:", query);
     });
 
     socket.on("disconnect", () => {
-       // console.log("disconnected");
+        console.log(" Disconnected");
     });
 });
 
-// REST API to get saved coin data
+// REST API to get saved crypto data (with caching)
 app.get("/api/crypto", async (req, res) => {
-    const coins = await Coin.find();
-    res.json(coins);
+    try {
+        const cacheKey = "cryptoData";
+        const cachedData = await redis.get(cacheKey);
+
+        if (cachedData) {
+            return res.json(JSON.parse(cachedData));
+        }
+
+        const coins = await Coin.find();
+        await redis.set(cacheKey, JSON.stringify(coins), "EX", 10);
+        res.json(coins);
+    } catch (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
 });
 
-// REST API to get search history
+// REST API to get search history (with caching)
 app.get("/api/search-history", async (req, res) => {
-    const history = await SearchHistory.find().sort({ timestamp: -1 }).limit(10);
-    res.json(history);
+    try {
+        const cacheKey = "searchHistory";
+        const cachedHistory = await redis.get(cacheKey);
+
+        if (cachedHistory) {
+            return res.json(JSON.parse(cachedHistory));
+        }
+
+        const history = await SearchHistory.find().sort({ timestamp: -1 }).limit(10);
+        await redis.set(cacheKey, JSON.stringify(history), "EX", 60);
+        res.json(history);
+    } catch (error) {
+        console.error("Error History:", error);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
 });
 
+// Health Check Route
+app.get("/", (req, res) => {
+    res.send("Tracker API is running...");
+});
 
-server.listen(5000, () => console.log("Server running on port 5000"));
+// Start Server
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`running on port ${PORT}`));
